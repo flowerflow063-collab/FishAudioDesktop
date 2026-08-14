@@ -1,3 +1,4 @@
+import subprocess
 import time
 from pathlib import Path
 
@@ -8,7 +9,6 @@ from mss import mss
 
 class SceneCompositor:
     """Renders the active FlowRecorder scene into video frames."""
-
     def __init__(self, scene, monitor, mode="horizontal", fps=30, webcam_index=0):
         self.scene = scene
         self.monitor = monitor
@@ -17,20 +17,15 @@ class SceneCompositor:
         self.webcam_index = webcam_index
         self.sct = mss()
         self.camera = None
-        self.last_frame = None
 
     @staticmethod
     def output_size(monitor, mode):
-        w, h = int(monitor["width"]), int(monitor["height"])
+        mw, mh = int(monitor["width"]), int(monitor["height"])
         if mode == "vertical":
-            w = min(w, int(h * 9 / 16))
-            w -= w % 2
-            h -= h % 2
+            w, h = min(mw, int(mh * 9 / 16)), mh
         else:
-            h = min(h, int(w * 9 / 16))
-            h -= h % 2
-            w -= w % 2
-        return max(2, w), max(2, h)
+            w, h = mw, min(mh, int(mw * 9 / 16))
+        return max(2, w - w % 2), max(2, h - h % 2)
 
     def _screen(self):
         frame = np.asarray(self.sct.grab(self.monitor), dtype=np.uint8)
@@ -42,13 +37,11 @@ class SceneCompositor:
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         ok, frame = self.camera.read()
-        if not ok:
-            return None
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)[:, :, ::-1]
+        return frame if ok else None
 
     @staticmethod
     def _fit(frame, width, height):
-        if frame is None:
+        if frame is None or width <= 1 or height <= 1:
             return None
         h, w = frame.shape[:2]
         if w <= 0 or h <= 0:
@@ -64,7 +57,6 @@ class SceneCompositor:
         y = max(0, min(canvas.shape[0] - 1, int(source.y * canvas.shape[0])))
         w = max(2, min(canvas.shape[1] - x, int(source.width * canvas.shape[1])))
         h = max(2, min(canvas.shape[0] - y, int(source.height * canvas.shape[0])))
-
         kind = source.kind.lower()
         frame = None
         if kind == "screen":
@@ -89,7 +81,6 @@ class SceneCompositor:
             frame = np.zeros((h, w, 3), dtype=np.uint8)
             cv2.putText(frame, source.name, (18, min(h - 12, 54)), cv2.FONT_HERSHEY_SIMPLEX,
                         max(.5, min(2.0, w / 500)), (245, 245, 245), 2, cv2.LINE_AA)
-
         if frame is not None:
             canvas[y:y + h, x:x + w] = frame
         else:
@@ -103,23 +94,48 @@ class SceneCompositor:
         for source in self.scene.sources:
             if source.enabled:
                 self._draw_source(canvas, source)
-        self.last_frame = canvas
         return canvas
 
     def close(self):
-        try:
-            self.sct.close()
-        except Exception:
-            pass
+        try: self.sct.close()
+        except Exception: pass
         if self.camera is not None:
-            try:
-                self.camera.release()
-            except Exception:
-                pass
-        for source in self.scene.sources:
-            capture = getattr(source, "_capture", None)
-            if capture is not None:
-                try:
-                    capture.release()
-                except Exception:
-                    pass
+            try: self.camera.release()
+            except Exception: pass
+
+
+class CompositeRecorderMixin:
+    """Replace Recorder's raw screen video worker with scene composition."""
+    def video(self):
+        compositor = SceneCompositor(self.scene, self.monitor, self.mode, self.fps)
+        width, height = compositor.output_size(self.monitor, self.mode)
+        ffmpeg = self.ffmpeg() if callable(getattr(self, "ffmpeg", None)) else "ffmpeg"
+        cmd = [ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-video_size", f"{width}x{height}", "-framerate", str(self.fps),
+               "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", "23", "-pix_fmt", "yuv420p", str(self.video_file)]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            interval = 1.0 / self.fps
+            next_frame = time.perf_counter()
+            while not self.stop_event.is_set():
+                proc.stdin.write(compositor.render().tobytes())
+                next_frame += interval
+                delay = next_frame - time.perf_counter()
+                if delay > 0: time.sleep(delay)
+                elif delay < -interval * 2: next_frame = time.perf_counter()
+            proc.stdin.close()
+            err = proc.stderr.read().decode(errors="replace")
+            if proc.wait(): self.errors.append("FFmpeg composición: " + (err[-2500:] or "error desconocido"))
+        except Exception as exc:
+            self.errors.append("Composición: " + str(exc))
+            if proc:
+                try: proc.kill()
+                except Exception: pass
+        finally:
+            compositor.close()
+
+
+def make_composite_recorder(base_recorder_cls):
+    return type("CompositeRecorder", (CompositeRecorderMixin, base_recorder_cls), {})
