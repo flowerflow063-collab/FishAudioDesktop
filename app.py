@@ -1,6 +1,8 @@
-from pathlib import Path
+
 import base64, json, mimetypes, os, queue, threading, time, urllib.request, urllib.error, tkinter as tk
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+import requests
 
 API_BASE = "https://api.fish.audio"
 
@@ -36,20 +38,43 @@ class FishAPI:
         return self.request("POST", "/v1/tts", payload, {"model": model}, raw=True)
 
     def asr_multipart(self, audio_path, language="", timestamps=False):
-        boundary = "----FishAudioBoundary7MA4YWxkTrZu0gW"
-        fn = os.path.basename(audio_path)
-        ctype = mimetypes.guess_type(fn)[0] or "application/octet-stream"
-        audio = Path(audio_path).read_bytes()
-        parts = []
-        def field(name, value):
-            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode())
-        field("language", language)
-        field("ignore_timestamps", "false" if timestamps else "true")
-        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="audio"; filename="{fn}"\r\nContent-Type: {ctype}\r\n\r\n').encode())
-        parts.append(audio + b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode())
-        body = b"".join(parts)
-        return self.request("POST", "/v1/asr", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        # Fish Audio ASR expects multipart/form-data. Use requests so the
+        # multipart boundary is generated correctly and enforce a timeout.
+        path = Path(audio_path)
+        if not path.exists():
+            raise RuntimeError(f"No se encontró el archivo: {path}")
+        lang = (language or "").strip().lower()
+        language_map = {
+            "español": "es", "espanol": "es", "spanish": "es",
+            "inglés": "en", "ingles": "en", "english": "en",
+            "francés": "fr", "frances": "fr", "french": "fr",
+            "alemán": "de", "aleman": "de", "german": "de",
+            "japonés": "ja", "japones": "ja", "japanese": "ja",
+            "coreano": "ko", "korean": "ko", "chino": "zh", "chinese": "zh",
+        }
+        lang = language_map.get(lang, lang)
+        data = {"ignore_timestamps": "false" if timestamps else "true"}
+        if lang:
+            data["language"] = lang
+        ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        with path.open("rb") as fh:
+            files = {"audio": (path.name, fh, ctype)}
+            try:
+                r = requests.post(
+                    API_BASE + "/v1/asr",
+                    headers={"Authorization": f"Bearer {self.key}", "User-Agent": "FishAudioDesktop/1.1"},
+                    data=data, files=files, timeout=(15, 120)
+                )
+            except requests.Timeout:
+                raise RuntimeError("La transcripción tardó más de 120 segundos. Comprueba tu conexión y vuelve a intentarlo.")
+            except requests.RequestException as e:
+                raise RuntimeError(f"Error de conexión con Fish Audio: {e}")
+        if not r.ok:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        try:
+            return r.json()
+        except ValueError:
+            raise RuntimeError("Fish Audio devolvió una respuesta que no es JSON.")
 
     def models(self):
         return self.request("GET", "/model")
@@ -200,7 +225,7 @@ class App(tk.Tk):
         ttk.Entry(row,textvariable=self.asr_file).pack(side="left",fill="x",expand=True)
         ttk.Button(row,text="Seleccionar audio",command=lambda:self.asr_file.set(filedialog.askopenfilename(filetypes=[("Audio","*.wav *.mp3 *.m4a *.ogg *.flac"),("Todos","*.*")]))).pack(side="left",padx=8)
         opts=ttk.Frame(f);opts.pack(fill="x")
-        self.asr_lang=tk.StringVar(); ttk.Label(opts,text="Idioma (opcional)").pack(side="left")
+        self.asr_lang=tk.StringVar(value="es"); ttk.Label(opts,text="Idioma (opcional; usa código como es, en, zh)").pack(side="left")
         ttk.Entry(opts,textvariable=self.asr_lang,width=15).pack(side="left",padx=8)
         self.timestamps=tk.BooleanVar(value=False); ttk.Checkbutton(opts,text="Timestamps",variable=self.timestamps).pack(side="left")
         ttk.Button(f,text="TRANSCRIBIR",style="Accent.TButton",command=self.transcribe).pack(anchor="w",pady=16)
@@ -211,7 +236,7 @@ class App(tk.Tk):
         if not self.need_api():return
         p=self.asr_file.get()
         if not p:return
-        self.status.set("Transcribiendo…")
+        self.status.set("Transcribiendo… (máx. 120 s)")
         self.run_bg(lambda:self.api.asr_multipart(p,self.asr_lang.get(),self.timestamps.get()),self.show_asr)
     def show_asr(self,r):
         self.asr_text.delete("1.0","end"); self.asr_text.insert("1.0",r.get("text",""))
