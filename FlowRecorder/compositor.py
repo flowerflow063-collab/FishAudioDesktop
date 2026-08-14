@@ -65,13 +65,11 @@ class SceneCompositor:
             frame = self._fit(self._camera(), w, h)
         elif kind == "image":
             path = getattr(source, "path", "")
-            if path and Path(path).exists():
-                frame = self._fit(cv2.imread(path), w, h)
+            if path and Path(path).exists(): frame = self._fit(cv2.imread(path), w, h)
         elif kind == "video":
             path = getattr(source, "path", "")
             if path and Path(path).exists():
-                if not hasattr(source, "_capture"):
-                    source._capture = cv2.VideoCapture(path)
+                if not hasattr(source, "_capture"): source._capture = cv2.VideoCapture(path)
                 ok, frame = source._capture.read()
                 if not ok:
                     source._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -92,8 +90,7 @@ class SceneCompositor:
         width, height = self.output_size(self.monitor, self.mode)
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         for source in self.scene.sources:
-            if source.enabled:
-                self._draw_source(canvas, source)
+            if source.enabled: self._draw_source(canvas, source)
         return canvas
 
     def close(self):
@@ -107,10 +104,10 @@ class SceneCompositor:
 class CompositeRecorderMixin:
     """Replace Recorder's raw screen video worker with scene composition."""
     def video(self):
+        from app import ffmpeg as bundled_ffmpeg
         compositor = SceneCompositor(self.scene, self.monitor, self.mode, self.fps)
         width, height = compositor.output_size(self.monitor, self.mode)
-        ffmpeg = self.ffmpeg() if callable(getattr(self, "ffmpeg", None)) else "ffmpeg"
-        cmd = [ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+        cmd = [bundled_ffmpeg(), "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-video_size", f"{width}x{height}", "-framerate", str(self.fps),
                "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
                "-crf", "23", "-pix_fmt", "yuv420p", str(self.video_file)]
