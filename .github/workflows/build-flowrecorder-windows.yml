@@ -40,7 +40,7 @@ jobs:
       - name: Build application
         working-directory: FlowRecorder
         run: |
-          pyinstaller --noconfirm --clean --windowed --name FlowRecorder --add-binary "ffmpeg.exe;." app.py
+          pyinstaller --noconfirm --clean --windowed --name FlowRecorder --add-binary "ffmpeg.exe;." studio.py
 
       - name: Create ZIP
         working-directory: FlowRecorder
