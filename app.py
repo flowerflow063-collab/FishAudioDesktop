@@ -9,6 +9,12 @@ from tkinter import ttk, filedialog, messagebox
 
 import requests
 
+try:
+    from audio_mixer import AudioMixer
+except Exception as _mixer_error:
+    AudioMixer = None
+    _MIXER_IMPORT_ERROR = _mixer_error
+
 API_BASE = "https://api.fish.audio"
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "FishAudioDesktop"
 CONFIG_FILE = APP_DIR / "config.json"
@@ -19,11 +25,7 @@ class FishAPI:
         self.key = (key or "").strip()
 
     def _headers(self, extra=None):
-        h = {
-            "Authorization": f"Bearer {self.key}",
-            "User-Agent": "FishAudioDesktop/2.1",
-            "Accept": "application/json",
-        }
+        h = {"Authorization": f"Bearer {self.key}", "User-Agent": "FishAudioDesktop/2.2", "Accept": "application/json"}
         if extra:
             h.update(extra)
         return h
@@ -47,9 +49,9 @@ class FishAPI:
         if status == 422:
             raise RuntimeError(f"Fish Audio rechazó los datos de {action}: {detail}")
         if status == 429:
-            raise RuntimeError(f"Fish Audio está limitando las solicitudes (429). Espera unos segundos y vuelve a intentarlo. Detalle: {detail}")
+            raise RuntimeError(f"Fish Audio está limitando las solicitudes (429). Espera unos segundos. Detalle: {detail}")
         if status == 503:
-            raise RuntimeError(f"Fish Audio está temporalmente no disponible (503). Espera unos segundos y vuelve a intentarlo. Detalle: {detail}")
+            raise RuntimeError(f"Fish Audio está temporalmente no disponible (503). Espera unos segundos. Detalle: {detail}")
         raise RuntimeError(f"Error de Fish Audio ({status}) en {action}: {detail}")
 
     def test_key(self):
@@ -62,15 +64,11 @@ class FishAPI:
         return True
 
     def tts(self, payload, model):
-        headers = self._headers({
-            "Content-Type": "application/json",
-            "model": model or "s2-pro",
-            "Accept": "audio/mpeg, audio/wav, audio/opus, application/octet-stream",
-        })
+        headers = self._headers({"Content-Type": "application/json", "model": model or "s2-pro", "Accept": "audio/mpeg, audio/wav, audio/opus, application/octet-stream"})
         try:
             r = requests.post(API_BASE + "/v1/tts", headers=headers, json=payload, timeout=(15, 180))
         except requests.Timeout:
-            raise RuntimeError("La generación de audio superó los 180 segundos. Comprueba la conexión y vuelve a intentarlo.")
+            raise RuntimeError("La generación de audio superó los 180 segundos.")
         except requests.RequestException as e:
             raise RuntimeError(f"No se pudo conectar con Fish Audio: {e}")
         if not r.ok:
@@ -86,35 +84,19 @@ class FishAPI:
         if path.stat().st_size == 0:
             raise RuntimeError("El archivo de audio está vacío.")
         lang = (language or "").strip().lower()
-        language_map = {
-            "español": "es", "espanol": "es", "spanish": "es",
-            "inglés": "en", "ingles": "en", "english": "en",
-            "francés": "fr", "frances": "fr", "french": "fr",
-            "alemán": "de", "aleman": "de", "german": "de",
-            "japonés": "ja", "japones": "ja", "japanese": "ja",
-            "coreano": "ko", "korean": "ko", "chino": "zh", "chinese": "zh",
-        }
+        language_map = {"español":"es", "espanol":"es", "spanish":"es", "inglés":"en", "ingles":"en", "english":"en", "francés":"fr", "frances":"fr", "french":"fr", "alemán":"de", "aleman":"de", "german":"de", "japonés":"ja", "japones":"ja", "japanese":"ja", "coreano":"ko", "korean":"ko", "chino":"zh", "chinese":"zh"}
         lang = language_map.get(lang, lang)
         data = {"ignore_timestamps": "false" if timestamps else "true"}
         if lang:
             data["language"] = lang
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-
-        # Fish Audio ASR requires multipart/form-data with the audio as a file.
-        # Retry transient 503 responses because the service can briefly be unavailable.
         last_error = None
         for attempt in range(3):
             try:
                 with path.open("rb") as fh:
-                    r = requests.post(
-                        API_BASE + "/v1/asr",
-                        headers=self._headers(),
-                        data=data,
-                        files={"audio": (path.name, fh, ctype)},
-                        timeout=(15, 120),
-                    )
+                    r = requests.post(API_BASE + "/v1/asr", headers=self._headers(), data=data, files={"audio": (path.name, fh, ctype)}, timeout=(15, 120))
             except requests.Timeout:
-                raise RuntimeError("La transcripción superó los 120 segundos. Comprueba la conexión y vuelve a intentarlo.")
+                raise RuntimeError("La transcripción superó los 120 segundos.")
             except requests.RequestException as e:
                 raise RuntimeError(f"No se pudo conectar con Fish Audio: {e}")
             if r.status_code == 503 and attempt < 2:
@@ -153,11 +135,7 @@ class FishAPI:
         return True
 
     def create_model_multipart(self, title, visibility, description, tags, files, texts):
-        data = {
-            "type": "tts", "title": title, "train_mode": "fast",
-            "visibility": visibility, "description": description,
-            "enhance_audio_quality": "true", "generate_sample": "false",
-        }
+        data = {"type":"tts", "title":title, "train_mode":"fast", "visibility":visibility, "description":description, "enhance_audio_quality":"true", "generate_sample":"false"}
         for tag in [x.strip() for x in tags.split(",") if x.strip()]:
             data.setdefault("tags", []).append(tag)
         for text in texts:
@@ -187,38 +165,68 @@ class FishAPI:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Fish Audio Desktop")
-        self.geometry("1120x760")
-        self.minsize(980, 650)
+        self.title("FlowRecorder — Fish Audio Desktop")
+        self.geometry("1220x820")
+        self.minsize(1050, 700)
         self.configure(bg="#10131a")
         self.api = None
         self.status = tk.StringVar(value="Sin API key")
+        self.mixer = None
         self._style()
         self._build()
         self._load_saved_key()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _style(self):
         s = ttk.Style(self)
         s.theme_use("clam")
         s.configure(".", background="#10131a", foreground="#e8ecf1", fieldbackground="#181d27")
         s.configure("TNotebook", background="#10131a", borderwidth=0)
-        s.configure("TNotebook.Tab", padding=(18, 10), background="#181d27", foreground="#b9c1cc")
+        s.configure("TNotebook.Tab", padding=(16, 10), background="#181d27", foreground="#b9c1cc")
         s.map("TNotebook.Tab", background=[("selected", "#252d3a")], foreground=[("selected", "#ffffff")])
         s.configure("TButton", padding=(12, 7), background="#2d3748", foreground="#fff")
         s.map("TButton", background=[("active", "#3b475a")])
         s.configure("Accent.TButton", background="#6d5dfc", foreground="#fff")
         s.configure("TEntry", padding=7)
+        s.configure("RootMixer.TFrame", background="#0f131a")
+        s.configure("Mixer.TFrame", background="#171d27")
+        s.configure("MixerHeader.TLabel", background="#0f131a", foreground="#e8ecf1", font=("Segoe UI", 16, "bold"))
+        s.configure("ChannelTitle.TLabel", background="#171d27", foreground="#e8ecf1", font=("Segoe UI", 10, "bold"))
+        s.configure("Muted.TLabel", background="#0f131a", foreground="#8f9aaa")
+        s.configure("MeterDb.TLabel", background="#171d27", foreground="#e8ecf1", font=("Segoe UI", 9, "bold"))
+        s.configure("Mute.TCheckbutton", background="#171d27", foreground="#e8ecf1")
 
     def _build(self):
         top = ttk.Frame(self, padding=12); top.pack(fill="x")
-        ttk.Label(top, text="FISH AUDIO DESKTOP", font=("Segoe UI", 18, "bold")).pack(side="left")
+        ttk.Label(top, text="FLOWRECORDER", font=("Segoe UI", 19, "bold")).pack(side="left")
+        ttk.Label(top, text="Audio Studio", foreground="#8f9aaa").pack(side="left", padx=10)
         ttk.Label(top, textvariable=self.status).pack(side="right")
         self.nb = ttk.Notebook(self); self.nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.tts_tab = ttk.Frame(self.nb, padding=14); self.asr_tab = ttk.Frame(self.nb, padding=14)
-        self.voices_tab = ttk.Frame(self.nb, padding=14); self.settings_tab = ttk.Frame(self.nb, padding=14)
-        self.nb.add(self.tts_tab, text="Texto → Voz"); self.nb.add(self.asr_tab, text="Audio → Texto")
-        self.nb.add(self.voices_tab, text="Voces / Clonación"); self.nb.add(self.settings_tab, text="Configuración")
-        self._tts(); self._asr(); self._voices(); self._settings()
+        self.tts_tab = ttk.Frame(self.nb, padding=14)
+        self.asr_tab = ttk.Frame(self.nb, padding=14)
+        self.voices_tab = ttk.Frame(self.nb, padding=14)
+        self.mixer_tab = ttk.Frame(self.nb, padding=0)
+        self.settings_tab = ttk.Frame(self.nb, padding=14)
+        self.nb.add(self.tts_tab, text="Texto → Voz")
+        self.nb.add(self.asr_tab, text="Audio → Texto")
+        self.nb.add(self.mixer_tab, text="🎚 Mezclador")
+        self.nb.add(self.voices_tab, text="Voces / Clonación")
+        self.nb.add(self.settings_tab, text="Configuración")
+        self._tts(); self._asr(); self._mixer(); self._voices(); self._settings()
+
+    def _mixer(self):
+        if AudioMixer is None:
+            box = ttk.Frame(self.mixer_tab, padding=25); box.pack(fill="both", expand=True)
+            ttk.Label(box, text="Mezclador no disponible", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+            ttk.Label(box, text=f"Instala las dependencias de audio y vuelve a compilar.\n\nDetalle: {_MIXER_IMPORT_ERROR}").pack(anchor="w", pady=12)
+            return
+        self.mixer = AudioMixer(self.mixer_tab, status_callback=self.status.set)
+        self.mixer.pack(fill="both", expand=True)
+
+    def _on_close(self):
+        if self.mixer:
+            self.mixer.shutdown()
+        self.destroy()
 
     def need_api(self):
         if not self.api:
@@ -239,7 +247,7 @@ class App(tk.Tk):
 
     def _show_error(self, text):
         self.status.set("Error")
-        messagebox.showerror("Fish Audio", text)
+        messagebox.showerror("FlowRecorder", text)
 
     def _tts(self):
         f = self.tts_tab
@@ -247,7 +255,7 @@ class App(tk.Tk):
         right = ttk.Frame(f); right.pack(side="right", fill="y", padx=(8, 0))
         ttk.Label(left, text="Texto", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         self.text = tk.Text(left, height=24, wrap="word", bg="#181d27", fg="#e8ecf1", insertbackground="white", relief="flat")
-        self.text.pack(fill="both", expand=True, pady=8); self.text.insert("1.0", "Hola. Esta es una prueba de Fish Audio Desktop.")
+        self.text.pack(fill="both", expand=True, pady=8); self.text.insert("1.0", "Hola. Esta es una prueba de FlowRecorder.")
         self.fields = {}
         def add(label, key, default):
             ttk.Label(right, text=label).pack(anchor="w", pady=(7, 2)); v = tk.StringVar(value=default); self.fields[key] = v
@@ -256,7 +264,7 @@ class App(tk.Tk):
         add("Velocidad (0.5–2)", "speed", "1.0"); add("Volumen (-20–20)", "volume", "0")
         add("Temperatura", "temperature", ""); add("Top P", "top_p", ""); add("Chunk length", "chunk_length", "300"); add("Latency", "latency", "normal")
         ttk.Label(right, text="Salida").pack(anchor="w", pady=(7, 2))
-        self.out = tk.StringVar(value=str(Path.home() / "Downloads" / "fish_audio.mp3"))
+        self.out = tk.StringVar(value=str(Path.home() / "Downloads" / "flowrecorder_audio.mp3"))
         row = ttk.Frame(right); row.pack(fill="x"); ttk.Entry(row, textvariable=self.out, width=28).pack(side="left"); ttk.Button(row, text="…", command=self.pick_out).pack(side="right")
         ttk.Button(right, text="GENERAR AUDIO", style="Accent.TButton", command=self.generate).pack(fill="x", pady=18)
 
@@ -370,7 +378,8 @@ class App(tk.Tk):
             if CONFIG_FILE.is_file():
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8")); key = str(data.get("api_key", "")).strip()
                 if key: self.key.set(key); self.api = FishAPI(key); self.status.set("API key cargada")
-        except Exception: pass
+        except Exception:
+            pass
 
     def save_key(self):
         k = self.key.get().strip()
@@ -380,7 +389,8 @@ class App(tk.Tk):
             try:
                 APP_DIR.mkdir(parents=True, exist_ok=True); CONFIG_FILE.write_text(json.dumps({"api_key": k}, ensure_ascii=False), encoding="utf-8")
                 self.api = api; self.status.set("API key configurada"); messagebox.showinfo("Listo", "API key válida y guardada. Ya puedes generar audio y transcribir.")
-            except Exception as e: self._show_error(f"La API key es válida, pero no se pudo guardar la configuración: {e}")
+            except Exception as e:
+                self._show_error(f"La API key es válida, pero no se pudo guardar la configuración: {e}")
         self.run_bg(api.test_key, done, "Comprobando API key…")
 
 
