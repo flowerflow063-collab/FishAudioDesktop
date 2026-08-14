@@ -183,11 +183,14 @@ class App(tk.Tk):
         model=self.fields["model"].get().strip() or "s2-pro"
         out=self.out.get()
         self.status.set("Generando…")
-        self.run_bg(lambda:self.api.tts(p,model),lambda:r)
-        def r(result):
-            data,_=result; Path(out).parent.mkdir(parents=True,exist_ok=True); Path(out).write_bytes(data)
+        def on_done(result):
+            data,_=result
+            Path(out).parent.mkdir(parents=True,exist_ok=True)
+            Path(out).write_bytes(data)
             self.status.set("Audio generado")
-            if messagebox.askyesno("Listo","Audio guardado. ¿Abrirlo ahora?"): os.startfile(out)
+            if messagebox.askyesno("Listo","Audio guardado. ¿Abrirlo ahora?"):
+                os.startfile(out)
+        self.run_bg(lambda:self.api.tts(p,model), on_done)
 
     def _asr(self):
         f=self.asr_tab
