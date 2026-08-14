@@ -1,0 +1,55 @@
+name: Build FlowRecorder for Windows
+
+on:
+  push:
+    paths:
+      - 'FlowRecorder/**'
+      - '.github/workflows/build-flowrecorder-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: FlowRecorder
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download FFmpeg
+        working-directory: FlowRecorder
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+          $exe = Get-ChildItem -Path ffmpeg_extract -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'No se encontro ffmpeg.exe' }
+          Copy-Item $exe.FullName -Destination ffmpeg.exe -Force
+          Remove-Item ffmpeg.zip -Force
+          Remove-Item ffmpeg_extract -Recurse -Force
+
+      - name: Build application
+        working-directory: FlowRecorder
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name FlowRecorder --add-binary "ffmpeg.exe;." app.py
+
+      - name: Create ZIP
+        working-directory: FlowRecorder
+        shell: pwsh
+        run: Compress-Archive -Path dist/FlowRecorder/* -DestinationPath FlowRecorder-Windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowRecorder-Windows
+          path: FlowRecorder/FlowRecorder-Windows.zip
+          if-no-files-found: error
