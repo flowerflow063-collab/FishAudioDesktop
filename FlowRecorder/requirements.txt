@@ -3,4 +3,5 @@ mss>=10,<11
 numpy>=2,<3
 sounddevice>=0.5,<1
 PyAudioWPatch>=0.2.12.8,<0.3
+opencv-python>=4.10,<5
 pyinstaller>=6.10,<7
