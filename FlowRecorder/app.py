@@ -28,9 +28,7 @@ def ffmpeg_path() -> str:
     if bundled.exists():
         return str(bundled)
     found = shutil.which("ffmpeg")
-    if found:
-        return found
-    return "ffmpeg"
+    return found or "ffmpeg"
 
 
 class Recorder:
@@ -42,10 +40,9 @@ class Recorder:
         self.stop_event = threading.Event()
         self.video_thread = None
         self.audio_thread = None
-        self.audio_queue = queue.Queue(maxsize=100)
+        self.audio_queue = queue.Queue(maxsize=150)
         self.audio_error = None
         self.video_error = None
-        self.started_at = None
         self.temp_video = None
         self.temp_wav = None
         self.final_file = None
@@ -59,7 +56,6 @@ class Recorder:
         self.temp_video = base.with_suffix(".video.mp4")
         self.temp_wav = base.with_suffix(".audio.wav")
         self.final_file = base.with_suffix(".mp4")
-        self.started_at = time.monotonic()
         self.stop_event.clear()
 
         self.video_thread = threading.Thread(target=self._record_video, daemon=True)
@@ -72,21 +68,16 @@ class Recorder:
         width = int(self.monitor["width"])
         height = int(self.monitor["height"])
         cmd = [
-            ffmpeg_path(), "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgra",
-            "-video_size", f"{width}x{height}",
-            "-framerate", str(self.fps),
-            "-i", "-",
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            str(self.temp_video),
+            ffmpeg_path(), "-y", "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-video_size", f"{width}x{height}", "-framerate", str(self.fps),
+            "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "23", "-pix_fmt", "yuv420p", str(self.temp_video),
         ]
         try:
-            process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
             with mss() as sct:
                 frame_time = 1.0 / self.fps
                 next_frame = time.perf_counter()
@@ -127,11 +118,8 @@ class Recorder:
             self._wav.setsampwidth(2)
             self._wav.setframerate(sample_rate)
             self._audio_stream = sd.InputStream(
-                samplerate=sample_rate,
-                channels=channels,
-                dtype="int16",
-                callback=self._audio_callback,
-                blocksize=1024,
+                samplerate=sample_rate, channels=channels, dtype="int16",
+                callback=self._audio_callback, blocksize=1024,
             )
             self._audio_stream.start()
             while not self.stop_event.is_set() or not self.audio_queue.empty():
@@ -166,21 +154,13 @@ class Recorder:
             raise RuntimeError(f"No se pudo grabar el vídeo:\n\n{self.video_error}")
         if not self.temp_video or not self.temp_video.exists():
             raise RuntimeError("FFmpeg no creó el archivo de vídeo.")
-
         if self.mic_enabled and self.audio_error:
             raise RuntimeError(f"No se pudo grabar el micrófono:\n\n{self.audio_error}")
 
         if self.mic_enabled and self.temp_wav and self.temp_wav.exists():
-            cmd = [
-                ffmpeg_path(), "-y",
-                "-i", str(self.temp_video),
-                "-i", str(self.temp_wav),
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                str(self.final_file),
-            ]
+            cmd = [ffmpeg_path(), "-y", "-i", str(self.temp_video), "-i", str(self.temp_wav),
+                   "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
+                   str(self.final_file)]
         else:
             cmd = [ffmpeg_path(), "-y", "-i", str(self.temp_video), "-c", "copy", str(self.final_file)]
 
@@ -201,128 +181,219 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1180, 760)
-        self.setMinimumSize(980, 650)
+        self.resize(1320, 820)
+        self.setMinimumSize(1080, 700)
         self.recorder = None
         self.recording = False
+        self.started_at = None
+
         self.preview_timer = QtCore.QTimer(self)
         self.preview_timer.timeout.connect(self.update_preview)
         self.clock_timer = QtCore.QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock)
-        self._build_ui()
-        self.refresh_monitors()
-        self.preview_timer.start(120)
 
-    def _build_ui(self):
+        self.build_ui()
+        self.refresh_monitors()
+        self.preview_timer.start(150)
+
+    def build_ui(self):
         self.setStyleSheet("""
-            QMainWindow { background: #10141b; color: #e9edf3; }
-            QWidget { color: #e9edf3; font-family: Segoe UI; font-size: 13px; }
-            QFrame#top { background: #171c25; border: 1px solid #2b3340; border-radius: 10px; }
-            QLabel#title { font-size: 25px; font-weight: 700; }
-            QLabel#status { color: #aab4c3; }
-            QGroupBox { border: 1px solid #2b3340; border-radius: 8px; margin-top: 12px; padding: 10px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #9aa8bb; }
-            QComboBox, QLineEdit { background: #1b222d; border: 1px solid #3a4453; border-radius: 6px; padding: 7px; }
-            QPushButton { background: #252e3b; border: 1px solid #455163; border-radius: 7px; padding: 9px 14px; }
-            QPushButton:hover { background: #303b4b; }
-            QPushButton#record { background: #e5484d; border: none; font-weight: 700; font-size: 15px; padding: 12px 22px; }
-            QPushButton#record:hover { background: #f15b60; }
-            QPushButton#stop { background: #394352; font-weight: 700; font-size: 15px; padding: 12px 22px; }
-            QCheckBox { spacing: 8px; }
-            QLabel#preview { background: #080a0e; border: 1px solid #2b3340; border-radius: 8px; }
-            QProgressBar { border: 1px solid #303947; border-radius: 4px; background: #171c25; height: 8px; }
-            QProgressBar::chunk { background: #e5484d; border-radius: 4px; }
+            QMainWindow, QWidget { background: #0b0f14; color: #edf2f7; font-family: Segoe UI; }
+            QFrame#sidebar { background: #10161e; border-right: 1px solid #202936; }
+            QLabel#brand { font-size: 22px; font-weight: 800; letter-spacing: 1px; }
+            QLabel#brand2 { color: #7f8da1; font-size: 11px; }
+            QPushButton#nav { text-align: left; background: transparent; border: 0; border-radius: 10px; padding: 12px 14px; color: #9daabd; font-size: 13px; }
+            QPushButton#nav:hover, QPushButton#nav[active="true"] { background: #19222e; color: #ffffff; }
+            QFrame#topbar { background: #0f141b; border-bottom: 1px solid #202936; }
+            QLabel#pageTitle { font-size: 20px; font-weight: 700; }
+            QLabel#status { color: #8997aa; }
+            QFrame#card { background: #111821; border: 1px solid #202b38; border-radius: 14px; }
+            QLabel#cardTitle { color: #a9b5c5; font-size: 12px; font-weight: 600; }
+            QLabel#bigValue { font-size: 22px; font-weight: 750; }
+            QLabel#preview { background: #05070a; border: 1px solid #263241; border-radius: 12px; }
+            QComboBox, QLineEdit { background: #0d131b; border: 1px solid #293544; border-radius: 9px; padding: 9px 10px; color: #e8edf3; }
+            QComboBox:hover, QLineEdit:focus { border: 1px solid #4a6079; }
+            QPushButton { background: #18212c; border: 1px solid #2b3948; border-radius: 9px; padding: 9px 13px; color: #e8edf3; }
+            QPushButton:hover { background: #202c3a; }
+            QPushButton#record { background: #e9434a; border: 0; border-radius: 11px; padding: 13px 26px; font-size: 14px; font-weight: 800; }
+            QPushButton#record:hover { background: #f25258; }
+            QPushButton#record:disabled { background: #4c2629; color: #a98b8d; }
+            QPushButton#stop { background: #18212c; border-radius: 11px; padding: 13px 22px; font-weight: 700; }
+            QPushButton#stop:disabled { color: #526071; }
+            QCheckBox { spacing: 8px; color: #d8e0e9; }
+            QCheckBox::indicator { width: 18px; height: 18px; }
+            QGroupBox { background: #111821; border: 1px solid #202b38; border-radius: 14px; margin-top: 10px; padding: 14px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #9ba8b9; background: #111821; }
+            QProgressBar { background: #0b1016; border: 0; border-radius: 4px; height: 7px; }
+            QProgressBar::chunk { background: #e9434a; border-radius: 4px; }
+            QScrollArea { border: 0; }
         """)
 
-        root = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
+        central = QtWidgets.QWidget()
+        main = QtWidgets.QHBoxLayout(central)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
+        self.setCentralWidget(central)
 
-        top = QtWidgets.QFrame(objectName="top")
+        sidebar = QtWidgets.QFrame(objectName="sidebar")
+        sidebar.setFixedWidth(205)
+        side = QtWidgets.QVBoxLayout(sidebar)
+        side.setContentsMargins(14, 20, 14, 18)
+        side.setSpacing(6)
+
+        brand = QtWidgets.QLabel("FLOWRECORDER", objectName="brand")
+        brand2 = QtWidgets.QLabel("SCREEN STUDIO", objectName="brand2")
+        side.addWidget(brand)
+        side.addWidget(brand2)
+        side.addSpacing(24)
+
+        for text, active in [("▣  Estudio", True), ("●  Grabaciones", False), ("◉  Audio", False), ("⚙  Ajustes", False)]:
+            b = QtWidgets.QPushButton(text, objectName="nav")
+            b.setProperty("active", active)
+            side.addWidget(b)
+        side.addStretch()
+
+        version = QtWidgets.QLabel("FlowRecorder 1.1\nConstruido para Windows")
+        version.setStyleSheet("color:#667487; font-size:10px;")
+        side.addWidget(version)
+        main.addWidget(side)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(24, 18, 24, 20)
+        content_layout.setSpacing(16)
+        main.addWidget(content, 1)
+
+        top = QtWidgets.QFrame(objectName="topbar")
+        top.setFixedHeight(58)
         top_layout = QtWidgets.QHBoxLayout(top)
-        title = QtWidgets.QLabel("FLOWRECORDER", objectName="title")
-        status = QtWidgets.QLabel("Listo para grabar", objectName="status")
-        self.status_label = status
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        title = QtWidgets.QLabel("Estudio", objectName="pageTitle")
+        self.status_label = QtWidgets.QLabel("●  Listo para grabar", objectName="status")
         top_layout.addWidget(title)
         top_layout.addStretch()
-        top_layout.addWidget(status)
-        layout.addWidget(top)
+        top_layout.addWidget(self.status_label)
+        content_layout.addWidget(top)
 
-        body = QtWidgets.QHBoxLayout()
-        body.setSpacing(14)
+        cards = QtWidgets.QHBoxLayout()
+        cards.setSpacing(12)
+        self.add_stat_card(cards, "MODO", "Pantalla", "▣")
+        self.fps_card = self.add_stat_card(cards, "FPS", "30", "◌")
+        self.timer_card = self.add_stat_card(cards, "DURACIÓN", "00:00:00", "◷")
+        self.audio_card = self.add_stat_card(cards, "AUDIO", "Micrófono", "♫")
+        content_layout.addLayout(cards)
 
-        left = QtWidgets.QVBoxLayout()
-        preview_box = QtWidgets.QGroupBox("Vista previa")
-        preview_layout = QtWidgets.QVBoxLayout(preview_box)
-        self.preview = QtWidgets.QLabel("Vista previa de pantalla", objectName="preview")
+        workspace = QtWidgets.QHBoxLayout()
+        workspace.setSpacing(16)
+
+        preview_card = QtWidgets.QFrame(objectName="card")
+        preview_layout = QtWidgets.QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(14, 14, 14, 14)
+        head = QtWidgets.QHBoxLayout()
+        label = QtWidgets.QLabel("VISTA PREVIA", objectName="cardTitle")
+        self.live_badge = QtWidgets.QLabel("● LIVE")
+        self.live_badge.setStyleSheet("color:#657386; font-size:10px; font-weight:700;")
+        head.addWidget(label)
+        head.addStretch()
+        head.addWidget(self.live_badge)
+        preview_layout.addLayout(head)
+        self.preview = QtWidgets.QLabel("Preparando vista previa…", objectName="preview")
         self.preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(640, 390)
-        preview_layout.addWidget(self.preview)
-        left.addWidget(preview_box, 1)
+        self.preview.setMinimumSize(650, 420)
+        preview_layout.addWidget(self.preview, 1)
+        workspace.addWidget(preview_card, 1)
 
-        controls = QtWidgets.QHBoxLayout()
-        self.record_btn = QtWidgets.QPushButton("●  GRABAR", objectName="record")
+        panel = QtWidgets.QVBoxLayout()
+        panel.setSpacing(12)
+        self.add_capture_card(panel)
+        self.add_audio_card(panel)
+        self.add_output_card(panel)
+        panel.addStretch()
+        workspace.addLayout(panel, 0)
+        content_layout.addLayout(workspace, 1)
+
+        bottom = QtWidgets.QFrame(objectName="card")
+        bottom_layout = QtWidgets.QHBoxLayout(bottom)
+        bottom_layout.setContentsMargins(14, 12, 14, 12)
+        self.record_btn = QtWidgets.QPushButton("●  INICIAR GRABACIÓN", objectName="record")
         self.record_btn.clicked.connect(self.start_recording)
-        self.stop_btn = QtWidgets.QPushButton("■  DETENER", objectName="stop")
+        self.stop_btn = QtWidgets.QPushButton("■  DETENER")
+        self.stop_btn.setObjectName("stop")
         self.stop_btn.clicked.connect(self.stop_recording)
         self.stop_btn.setEnabled(False)
-        self.timer_label = QtWidgets.QLabel("00:00:00")
-        self.timer_label.setStyleSheet("font-size: 20px; font-weight: 700; font-family: Consolas;")
-        controls.addWidget(self.record_btn)
-        controls.addWidget(self.stop_btn)
-        controls.addStretch()
-        controls.addWidget(self.timer_label)
-        left.addLayout(controls)
-        body.addLayout(left, 1)
+        self.bottom_timer = QtWidgets.QLabel("00:00:00", objectName="bigValue")
+        bottom_layout.addWidget(self.record_btn)
+        bottom_layout.addWidget(self.stop_btn)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.bottom_timer)
+        content_layout.addWidget(bottom)
 
-        settings = QtWidgets.QVBoxLayout()
-        capture = QtWidgets.QGroupBox("Captura")
-        form = QtWidgets.QFormLayout(capture)
+    def add_stat_card(self, layout, title, value, icon):
+        card = QtWidgets.QFrame(objectName="card")
+        box = QtWidgets.QHBoxLayout(card)
+        box.setContentsMargins(13, 10, 13, 10)
+        ico = QtWidgets.QLabel(icon)
+        ico.setStyleSheet("font-size:18px; color:#c4cfdb;")
+        texts = QtWidgets.QVBoxLayout()
+        t = QtWidgets.QLabel(title, objectName="cardTitle")
+        v = QtWidgets.QLabel(value, objectName="bigValue")
+        texts.addWidget(t)
+        texts.addWidget(v)
+        box.addWidget(ico)
+        box.addLayout(texts)
+        layout.addWidget(card, 1)
+        return v
+
+    def add_capture_card(self, layout):
+        box = QtWidgets.QGroupBox("CAPTURA")
+        form = QtWidgets.QFormLayout(box)
+        form.setVerticalSpacing(10)
         self.monitor_combo = QtWidgets.QComboBox()
         self.fps_combo = QtWidgets.QComboBox()
         self.fps_combo.addItems([str(x) for x in FPS_OPTIONS])
         self.fps_combo.setCurrentText("30")
-        form.addRow("Pantalla:", self.monitor_combo)
-        form.addRow("FPS:", self.fps_combo)
-        settings.addWidget(capture)
+        self.fps_combo.currentTextChanged.connect(self.on_fps_changed)
+        form.addRow("Pantalla", self.monitor_combo)
+        form.addRow("Calidad", self.fps_combo)
+        layout.addWidget(box)
 
-        audio = QtWidgets.QGroupBox("Audio")
-        audio_form = QtWidgets.QVBoxLayout(audio)
+    def add_audio_card(self, layout):
+        box = QtWidgets.QGroupBox("AUDIO")
+        v = QtWidgets.QVBoxLayout(box)
         self.mic_check = QtWidgets.QCheckBox("Grabar micrófono")
         self.mic_check.setChecked(True)
-        audio_form.addWidget(self.mic_check)
-        audio_form.addWidget(QtWidgets.QLabel("En esta primera versión grabamos el micrófono. El audio del sistema se añadirá en la siguiente fase."))
-        settings.addWidget(audio)
+        self.mic_check.stateChanged.connect(self.on_mic_changed)
+        v.addWidget(self.mic_check)
+        hint = QtWidgets.QLabel("Audio del sistema: próximamente")
+        hint.setStyleSheet("color:#68778a; font-size:10px;")
+        v.addWidget(hint)
+        layout.addWidget(box)
 
-        output = QtWidgets.QGroupBox("Destino")
-        out_layout = QtWidgets.QVBoxLayout(output)
+    def add_output_card(self, layout):
+        box = QtWidgets.QGroupBox("DESTINO")
+        v = QtWidgets.QVBoxLayout(box)
         row = QtWidgets.QHBoxLayout()
         self.output_edit = QtWidgets.QLineEdit(str(Path.home() / "Videos" / "FlowRecorder"))
         browse = QtWidgets.QPushButton("Elegir")
         browse.clicked.connect(self.choose_output)
         row.addWidget(self.output_edit)
         row.addWidget(browse)
-        out_layout.addLayout(row)
-        settings.addWidget(output)
-
-        info = QtWidgets.QGroupBox("Estado")
-        info_layout = QtWidgets.QVBoxLayout(info)
-        self.info_label = QtWidgets.QLabel("FlowRecorder 1.0\nPantalla + micrófono + MP4")
-        self.info_label.setWordWrap(True)
-        info_layout.addWidget(self.info_label)
-        settings.addWidget(info)
-        settings.addStretch()
-        body.addLayout(settings, 0)
-
-        layout.addLayout(body, 1)
-        self.setCentralWidget(root)
+        v.addLayout(row)
+        self.file_label = QtWidgets.QLabel("MP4 • H.264 • AAC")
+        self.file_label.setStyleSheet("color:#68778a; font-size:10px;")
+        v.addWidget(self.file_label)
+        layout.addWidget(box)
 
     def refresh_monitors(self):
         self.monitor_combo.clear()
-        with mss() as sct:
-            for i, monitor in enumerate(sct.monitors[1:], 1):
-                self.monitor_combo.addItem(f"Pantalla {i} — {monitor['width']}×{monitor['height']}", monitor)
+        try:
+            with mss() as sct:
+                for i, monitor in enumerate(sct.monitors[1:], 1):
+                    self.monitor_combo.addItem(
+                        f"Pantalla {i}  ·  {monitor['width']}×{monitor['height']}", monitor
+                    )
+        except Exception as exc:
+            self.monitor_combo.addItem("No se pudo detectar la pantalla")
         if self.monitor_combo.count() == 0:
             self.monitor_combo.addItem("No se detectó pantalla")
 
@@ -331,19 +402,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    def on_fps_changed(self, value):
+        if hasattr(self, "fps_card"):
+            self.fps_card.setText(value)
+
+    def on_mic_changed(self, state):
+        if hasattr(self, "audio_card"):
+            self.audio_card.setText("Micrófono" if state else "Sin audio")
+
     def update_preview(self):
         if self.recording:
             return
         try:
+            monitor = self.monitor_combo.currentData()
+            if not monitor:
+                return
             with mss() as sct:
-                monitor = self.monitor_combo.currentData()
-                if not monitor:
-                    return
                 shot = np.asarray(sct.grab(monitor))
-                h, w, _ = shot.shape
-                image = QtGui.QImage(shot.data, w, h, 4 * w, QtGui.QImage.Format.Format_ARGB32).copy()
-                pix = QtGui.QPixmap.fromImage(image)
-                self.preview.setPixmap(pix.scaled(self.preview.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+            h, w, _ = shot.shape
+            image = QtGui.QImage(shot.data, w, h, 4 * w, QtGui.QImage.Format.Format_ARGB32).copy()
+            pix = QtGui.QPixmap.fromImage(image)
+            self.preview.setPixmap(pix.scaled(
+                self.preview.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            ))
         except Exception:
             pass
 
@@ -358,6 +440,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not output_dir:
             QtWidgets.QMessageBox.warning(self, APP_NAME, "Selecciona una carpeta de salida.")
             return
+
         fps = int(self.fps_combo.currentText())
         self.recorder = Recorder(monitor, fps, output_dir, self.mic_check.isChecked())
         try:
@@ -365,54 +448,58 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, APP_NAME, str(exc))
             return
+
         self.recording = True
+        self.started_at = time.monotonic()
         self.record_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.mic_check.setEnabled(False)
         self.monitor_combo.setEnabled(False)
         self.fps_combo.setEnabled(False)
-        self.status_label.setText("● GRABANDO")
-        self.status_label.setStyleSheet("color: #ff6b70; font-weight: 700;")
-        self.timer_label.setText("00:00:00")
+        self.status_label.setText("●  GRABANDO")
+        self.status_label.setStyleSheet("color:#ff5960; font-weight:800;")
+        self.live_badge.setStyleSheet("color:#ff5960; font-size:10px; font-weight:800;")
         self.clock_timer.start(250)
 
     def stop_recording(self):
         if not self.recording or not self.recorder:
             return
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("Guardando…")
+        self.status_label.setText("●  GUARDANDO…")
         QtWidgets.QApplication.processEvents()
         try:
             final_file = self.recorder.stop()
-            self.status_label.setText("Grabación guardada")
-            self.info_label.setText(f"Archivo creado:\n{final_file}")
+            self.status_label.setText("●  Grabación guardada")
+            self.file_label.setText(f"Guardado: {final_file.name}")
             QtWidgets.QMessageBox.information(self, APP_NAME, f"Grabación terminada.\n\n{final_file}")
         except Exception as exc:
-            self.status_label.setText("Error")
+            self.status_label.setText("●  Error")
             QtWidgets.QMessageBox.critical(self, APP_NAME, str(exc))
         finally:
             self.recording = False
+            self.clock_timer.stop()
             self.record_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.mic_check.setEnabled(True)
             self.monitor_combo.setEnabled(True)
             self.fps_combo.setEnabled(True)
-            self.clock_timer.stop()
-            self.timer_label.setText("00:00:00")
-            self.recorder = None
-            self.preview_timer.start(120)
+            self.live_badge.setStyleSheet("color:#657386; font-size:10px; font-weight:700;")
 
     def update_clock(self):
-        if not self.recorder or not self.recorder.started_at:
+        if not self.started_at:
             return
-        seconds = int(time.monotonic() - self.recorder.started_at)
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        self.timer_label.setText(f"{h:02d}:{m:02d}:{s:02d}")
+        elapsed = int(time.monotonic() - self.started_at)
+        text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        self.bottom_timer.setText(text)
+        self.timer_card.setText(text)
 
     def closeEvent(self, event):
         if self.recording:
-            answer = QtWidgets.QMessageBox.question(self, APP_NAME, "Hay una grabación en curso. ¿Detenerla y cerrar?")
+            answer = QtWidgets.QMessageBox.question(
+                self, APP_NAME,
+                "Hay una grabación activa. ¿Quieres detenerla antes de salir?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
             if answer == QtWidgets.QMessageBox.StandardButton.Yes:
                 self.stop_recording()
             else:
@@ -424,6 +511,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setStyle("Fusion")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
