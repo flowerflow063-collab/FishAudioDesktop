@@ -1,11 +1,8 @@
-import os
 import subprocess
 import tempfile
 import threading
-import time
 import wave
 from pathlib import Path
-from queue import Queue
 
 import cv2
 import mss
@@ -141,7 +138,6 @@ class StudioRecorder:
         target_h = max(180, int(camera.shape[0] * target_w / camera.shape[1]))
         camera = cv2.resize(camera, (target_w, target_h))
         if self.layout.get() == "vertical":
-            screen = cv2.resize(screen, (w, int(h * 1.0)))
             camera = cv2.resize(camera, (w, int(camera.shape[0] * w / camera.shape[1])))
             return np.vstack([screen, camera])
         canvas = screen.copy()
@@ -199,7 +195,7 @@ class StudioRecorder:
         if sc is not None:
             try:
                 speaker = sc.default_speaker()
-                loopback = speaker.loopback_mic()
+                loopback = sc.get_microphone(speaker.name, include_loopback=True)
                 def loop_worker():
                     with loopback.recorder(samplerate=self.audio_rate, channels=2, blocksize=1024) as rec:
                         while not self.audio_stop.is_set():
