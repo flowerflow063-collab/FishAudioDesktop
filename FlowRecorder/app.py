@@ -1,18 +1,9 @@
-import os
-import sys
-import time
-import wave
-import queue
-import shutil
-import threading
-import subprocess
+import os, sys, time, wave, queue, shutil, threading, subprocess
 from pathlib import Path
-
 import numpy as np
 import sounddevice as sd
 from mss import mss
 from PySide6 import QtCore, QtGui, QtWidgets
-
 try:
     import pyaudiowpatch as pyaudio
     SYSTEM_AUDIO_AVAILABLE = True
@@ -21,782 +12,272 @@ except ImportError:
     SYSTEM_AUDIO_AVAILABLE = False
 
 APP_NAME = "FlowRecorder"
-FPS_OPTIONS = [15, 24, 30, 60]
+FPS = [15, 24, 30, 60]
 
+def ffmpeg():
+    local = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent / "ffmpeg.exe"
+    return str(local) if local.exists() else (shutil.which("ffmpeg") or "ffmpeg")
 
-def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def ffmpeg_path() -> str:
-    bundled = app_dir() / "ffmpeg.exe"
-    if bundled.exists():
-        return str(bundled)
-    return shutil.which("ffmpeg") or "ffmpeg"
-
+def level(data):
+    a = np.asarray(data, dtype=np.float32)
+    if not a.size: return 0.0
+    rms = float(np.sqrt(np.mean(a*a)))
+    if rms <= 1: return 0.0
+    db = 20*np.log10(rms/32768.0)
+    return max(0.0, min(100.0, (db+60)*100/60))
 
 class Recorder:
-    def __init__(self, monitor, fps, output_dir, mic_enabled=True, system_enabled=True):
-        self.monitor = monitor
-        self.fps = fps
-        self.output_dir = Path(output_dir)
-        self.mic_enabled = mic_enabled
-        self.system_enabled = system_enabled and SYSTEM_AUDIO_AVAILABLE
+    def __init__(self, monitor, fps, out, mode, mic, system, gains, mutes):
+        self.monitor, self.fps, self.out, self.mode = dict(monitor), fps, Path(out), mode
+        self.mic, self.system = mic, system and SYSTEM_AUDIO_AVAILABLE
+        self.gains, self.mutes = dict(gains), dict(mutes)
+        self.stop_event = threading.Event(); self.lock = threading.Lock()
+        self.mic_level = self.system_level = 0.0
+        self.errors = []
+        self.mq = queue.Queue(maxsize=150); self.mt = self.st = self.vt = None
+        self.mw = self.sw = self.ss = self.spa = None
 
-        self.stop_event = threading.Event()
-        self.video_thread = None
-        self.mic_thread = None
-        self.system_thread = None
+    def set_channel(self, ch, gain=None, mute=None):
+        with self.lock:
+            if gain is not None: self.gains[ch] = gain
+            if mute is not None: self.mutes[ch] = mute
 
-        self.video_error = None
-        self.mic_error = None
-        self.system_error = None
+    def state(self, ch):
+        with self.lock: return self.gains[ch], self.mutes[ch]
 
-        self.temp_video = None
-        self.temp_mic = None
-        self.temp_system = None
-        self.final_file = None
-
-        self._mic_stream = None
-        self._mic_wav = None
-        self._mic_queue = queue.Queue(maxsize=150)
-
-        self._system_pa = None
-        self._system_stream = None
-        self._system_wav = None
+    def rect(self):
+        m = self.monitor; w, h = int(m['width']), int(m['height'])
+        if self.mode == 'vertical':
+            nw = min(w, int(h*9/16)); nw -= nw % 2
+            return {'left': m['left']+(w-nw)//2, 'top': m['top'], 'width': nw, 'height': h-h%2}
+        nh = min(h, int(w*9/16)); nh -= nh % 2
+        return {'left': m['left'], 'top': m['top']+(h-nh)//2, 'width': w-w%2, 'height': nh}
 
     def start(self):
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        base = self.output_dir / f"FlowRecorder_{stamp}"
+        self.out.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S'); tag = 'vertical' if self.mode == 'vertical' else 'horizontal'
+        base = self.out / f'FlowRecorder_{tag}_{stamp}'
+        self.video_file = base.with_suffix('.video.mp4'); self.micfile = base.with_suffix('.mic.wav') if self.mic else None
+        self.sysfile = base.with_suffix('.system.wav') if self.system else None; self.final = base.with_suffix('.mp4')
+        self.stop_event.clear(); self.vt = threading.Thread(target=self.video, daemon=True)
+        self.vt.start()
+        if self.mic: self.mt = threading.Thread(target=self.mic_capture, daemon=True); self.mt.start()
+        if self.system: self.st = threading.Thread(target=self.system_capture, daemon=True); self.st.start()
 
-        self.temp_video = base.with_suffix(".video.mp4")
-        self.temp_mic = base.with_suffix(".mic.wav") if self.mic_enabled else None
-        self.temp_system = base.with_suffix(".system.wav") if self.system_enabled else None
-        self.final_file = base.with_suffix(".mp4")
-        self.stop_event.clear()
-
-        self.video_thread = threading.Thread(target=self._record_video, daemon=True)
-        self.video_thread.start()
-
-        if self.mic_enabled:
-            self.mic_thread = threading.Thread(target=self._record_mic, daemon=True)
-            self.mic_thread.start()
-
-        if self.system_enabled:
-            self.system_thread = threading.Thread(target=self._record_system, daemon=True)
-            self.system_thread.start()
-
-    def _record_video(self):
-        width = int(self.monitor["width"])
-        height = int(self.monitor["height"])
-        cmd = [
-            ffmpeg_path(), "-y",
-            "-f", "rawvideo", "-pix_fmt", "bgra",
-            "-video_size", f"{width}x{height}",
-            "-framerate", str(self.fps),
-            "-i", "-",
-            "-an", "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", "23", "-pix_fmt", "yuv420p",
-            str(self.temp_video),
-        ]
-        process = None
+    def video(self):
+        r = self.rect(); cmd = [ffmpeg(),'-y','-f','rawvideo','-pix_fmt','bgra','-video_size',f"{r['width']}x{r['height']}",'-framerate',str(self.fps),'-i','-','-an','-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p',str(self.video_file)]
+        p = None
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             with mss() as sct:
-                frame_time = 1.0 / self.fps
-                next_frame = time.perf_counter()
+                step=1/self.fps; nxt=time.perf_counter()
                 while not self.stop_event.is_set():
-                    frame = np.asarray(sct.grab(self.monitor), dtype=np.uint8)
-                    process.stdin.write(frame.tobytes())
-                    next_frame += frame_time
-                    delay = next_frame - time.perf_counter()
-                    if delay > 0:
-                        time.sleep(delay)
-                    elif delay < -frame_time * 2:
-                        next_frame = time.perf_counter()
+                    p.stdin.write(np.asarray(sct.grab(r), dtype=np.uint8).tobytes()); nxt += step
+                    d=nxt-time.perf_counter()
+                    if d>0: time.sleep(d)
+                    elif d < -step*2: nxt=time.perf_counter()
+            p.stdin.close(); err=p.stderr.read().decode(errors='replace'); code=p.wait()
+            if code: self.errors.append('FFmpeg: '+(err[-2500:] or str(code)))
+        except Exception as e:
+            self.errors.append('Vídeo: '+str(e))
+            if p:
+                try: p.kill()
+                except: pass
 
-            try:
-                process.stdin.close()
-            except Exception:
-                pass
+    def mic_cb(self, data, frames, t, status):
+        self.mic_level = level(data)
+        if status: self.errors.append('Micrófono: '+str(status))
+        try: self.mq.put_nowait(data.copy())
+        except queue.Full: pass
 
-            stderr = process.stderr.read().decode("utf-8", errors="replace")
-            code = process.wait()
-            if code != 0:
-                self.video_error = stderr[-3000:] or f"FFmpeg terminó con código {code}."
-        except Exception as exc:
-            self.video_error = str(exc)
-            if process is not None:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+    def process(self, data, ch):
+        gain, mute = self.state(ch); a=np.asarray(data,dtype=np.float32)
+        if mute or gain <= 0: return np.zeros_like(a,dtype=np.int16)
+        return np.clip(a*gain,-32768,32767).astype(np.int16)
 
-    def _mic_callback(self, indata, frames, callback_time, status):
-        if status:
-            self.mic_error = str(status)
+    def mic_capture(self):
         try:
-            self._mic_queue.put_nowait(indata.copy())
-        except queue.Full:
-            pass
-
-    def _record_mic(self):
-        try:
-            device = sd.query_devices(kind="input")
-            max_channels = int(device.get("max_input_channels", 0))
-            if max_channels < 1:
-                raise RuntimeError("Windows no tiene un micrófono de entrada disponible.")
-
-            channels = min(2, max_channels)
-            sample_rate = int(device.get("default_samplerate") or 48000)
-
-            self._mic_wav = wave.open(str(self.temp_mic), "wb")
-            self._mic_wav.setnchannels(channels)
-            self._mic_wav.setsampwidth(2)
-            self._mic_wav.setframerate(sample_rate)
-
-            self._mic_stream = sd.InputStream(
-                device=device["name"],
-                samplerate=sample_rate,
-                channels=channels,
-                dtype="int16",
-                callback=self._mic_callback,
-                blocksize=1024,
-            )
-            self._mic_stream.start()
-
-            while not self.stop_event.is_set() or not self._mic_queue.empty():
-                try:
-                    chunk = self._mic_queue.get(timeout=0.2)
-                    self._mic_wav.writeframes(chunk.astype(np.int16).tobytes())
-                except queue.Empty:
-                    continue
-        except Exception as exc:
-            self.mic_error = str(exc)
+            dev=sd.query_devices(kind='input'); channels=min(2,int(dev.get('max_input_channels',0)))
+            if channels<1: raise RuntimeError('No hay micrófono de entrada disponible en Windows.')
+            rate=int(dev.get('default_samplerate') or 48000)
+            self.mw=wave.open(str(self.micfile),'wb'); self.mw.setnchannels(channels); self.mw.setsampwidth(2); self.mw.setframerate(rate)
+            s=sd.InputStream(device=dev['name'],samplerate=rate,channels=channels,dtype='int16',callback=self.mic_cb,blocksize=1024); self.mic_stream=s; s.start()
+            while not self.stop_event.is_set() or not self.mq.empty():
+                try: self.mw.writeframes(self.process(self.mq.get(timeout=.2),'mic').tobytes())
+                except queue.Empty: pass
+        except Exception as e: self.errors.append('Micrófono: '+str(e))
         finally:
-            try:
-                if self._mic_stream is not None:
-                    self._mic_stream.stop()
-                    self._mic_stream.close()
-            except Exception:
-                pass
-            try:
-                if self._mic_wav is not None:
-                    self._mic_wav.close()
-            except Exception:
-                pass
+            try: self.mic_stream.stop(); self.mic_stream.close()
+            except: pass
+            try: self.mw.close()
+            except: pass
 
-    def _record_system(self):
-        pa = None
-        stream = None
-        wav_file = None
+    def system_capture(self):
+        pa=stream=wf=None
         try:
-            pa = pyaudio.PyAudio()
-            self._system_pa = pa
-
-            try:
-                loopback = pa.get_default_wasapi_loopback()
+            pa=pyaudio.PyAudio()
+            try: loop=pa.get_default_wasapi_loopback()
             except Exception:
-                wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-                default_output = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
-                loopback = None
-                for item in pa.get_loopback_device_info_generator():
-                    if default_output["name"] in item["name"]:
-                        loopback = item
-                        break
-                if loopback is None:
-                    raise RuntimeError(
-                        "No se encontró el dispositivo WASAPI de audio del sistema. "
-                        "Comprueba que Windows tenga una salida de audio activa."
-                    )
-
-            channels = max(1, min(2, int(loopback.get("maxInputChannels", 2))))
-            sample_rate = int(loopback.get("defaultSampleRate") or 48000)
-            device_index = int(loopback["index"])
-
-            wav_file = wave.open(str(self.temp_system), "wb")
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-            wav_file.setframerate(sample_rate)
-            self._system_wav = wav_file
-
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=channels,
-                rate=sample_rate,
-                frames_per_buffer=1024,
-                input=True,
-                input_device_index=device_index,
-            )
-            self._system_stream = stream
-
+                api=pa.get_host_api_info_by_type(pyaudio.paWASAPI); out=pa.get_device_info_by_index(api['defaultOutputDevice']); loop=next((x for x in pa.get_loopback_device_info_generator() if out['name'] in x['name']),None)
+                if loop is None: raise RuntimeError('No se encontró la salida WASAPI de Windows.')
+            ch=max(1,min(2,int(loop.get('maxInputChannels',2)))); rate=int(loop.get('defaultSampleRate') or 48000); idx=int(loop['index'])
+            wf=wave.open(str(self.sysfile),'wb'); wf.setnchannels(ch); wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16)); wf.setframerate(rate)
+            stream=pa.open(format=pyaudio.paInt16,channels=ch,rate=rate,frames_per_buffer=1024,input=True,input_device_index=idx)
+            self.ss=stream; self.spa=pa
             while not self.stop_event.is_set():
-                try:
-                    data = stream.read(1024, exception_on_overflow=False)
-                    wav_file.writeframes(data)
-                except Exception as exc:
-                    self.system_error = str(exc)
-                    break
-        except Exception as exc:
-            self.system_error = str(exc)
+                raw=np.frombuffer(stream.read(1024,exception_on_overflow=False),dtype=np.int16); self.system_level=level(raw); wf.writeframes(self.process(raw,'system').tobytes())
+        except Exception as e: self.errors.append('Audio del sistema: '+str(e))
         finally:
-            try:
-                if stream is not None:
-                    stream.stop_stream()
-                    stream.close()
-            except Exception:
-                pass
-            try:
-                if wav_file is not None:
-                    wav_file.close()
-            except Exception:
-                pass
-            try:
-                if pa is not None:
-                    pa.terminate()
-            except Exception:
-                pass
-            self._system_stream = None
-            self._system_pa = None
-
-    def _audio_files_ready(self):
-        sources = []
-        if self.mic_enabled:
-            if self.mic_error:
-                raise RuntimeError(f"No se pudo grabar el micrófono:\n\n{self.mic_error}")
-            if not self.temp_mic or not self.temp_mic.exists() or self.temp_mic.stat().st_size <= 44:
-                raise RuntimeError("El micrófono estaba activado, pero no produjo audio.")
-            sources.append(self.temp_mic)
-
-        if self.system_enabled:
-            if self.system_error:
-                raise RuntimeError(
-                    f"No se pudo grabar el audio del sistema:\n\n{self.system_error}\n\n"
-                    "Si Windows no tiene una salida de audio activa, selecciona una salida en "
-                    "Configuración de sonido y vuelve a intentarlo."
-                )
-            if not self.temp_system or not self.temp_system.exists() or self.temp_system.stat().st_size <= 44:
-                raise RuntimeError("El audio del sistema estaba activado, pero no produjo audio.")
-            sources.append(self.temp_system)
-
-        return sources
+            try: stream.stop_stream(); stream.close()
+            except: pass
+            try: wf.close()
+            except: pass
+            try: pa.terminate()
+            except: pass
 
     def stop(self):
         self.stop_event.set()
-
-        if self.video_thread:
-            self.video_thread.join(timeout=30)
-        if self.mic_thread:
-            self.mic_thread.join(timeout=10)
-        if self.system_thread:
-            self.system_thread.join(timeout=10)
-
-        if self.video_error:
-            raise RuntimeError(f"No se pudo grabar el vídeo:\n\n{self.video_error}")
-        if not self.temp_video or not self.temp_video.exists():
-            raise RuntimeError("FFmpeg no creó el archivo de vídeo.")
-
-        sources = self._audio_files_ready()
-
-        if not sources:
-            cmd = [
-                ffmpeg_path(), "-y",
-                "-i", str(self.temp_video),
-                "-c", "copy",
-                str(self.final_file),
-            ]
-        elif len(sources) == 1:
-            cmd = [
-                ffmpeg_path(), "-y",
-                "-i", str(self.temp_video),
-                "-i", str(sources[0]),
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                str(self.final_file),
-            ]
-        else:
-            cmd = [
-                ffmpeg_path(), "-y",
-                "-i", str(self.temp_video),
-                "-i", str(sources[0]),
-                "-i", str(sources[1]),
-                "-filter_complex",
-                "[1:a]aresample=48000[a1];"
-                "[2:a]aresample=48000[a2];"
-                "[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
-                "-map", "0:v:0", "-map", "[aout]",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                str(self.final_file),
-            ]
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "No se pudo crear el MP4 final:\n\n" + result.stderr[-4000:]
-            )
-
-        for temp in (self.temp_video, self.temp_mic, self.temp_system):
+        for t,sec in ((self.vt,30),(self.mt,10),(self.st,10)):
+            if t: t.join(sec)
+        if self.errors: raise RuntimeError('\n\n'.join(self.errors[-3:]))
+        if not self.video_file.exists(): raise RuntimeError('FFmpeg no creó el vídeo.')
+        aud=[x for x in (self.micfile,self.sysfile) if x]
+        if len(aud)==0: cmd=[ffmpeg(),'-y','-i',str(self.video_file),'-c','copy',str(self.final)]
+        elif len(aud)==1: cmd=[ffmpeg(),'-y','-i',str(self.video_file),'-i',str(aud[0]),'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','192k','-shortest',str(self.final)]
+        else: cmd=[ffmpeg(),'-y','-i',str(self.video_file),'-i',str(aud[0]),'-i',str(aud[1]),'-filter_complex','[1:a]aresample=48000[a1];[2:a]aresample=48000[a2];[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2[aout]','-map','0:v:0','-map','[aout]','-c:v','copy','-c:a','aac','-b:a','192k','-shortest',str(self.final)]
+        r=subprocess.run(cmd,capture_output=True,text=True,encoding='utf-8',errors='replace')
+        if r.returncode: raise RuntimeError('No se pudo crear el MP4:\n\n'+r.stderr[-3000:])
+        for f in (self.video_file,self.micfile,self.sysfile):
             try:
-                if temp and temp.exists():
-                    temp.unlink()
-            except Exception:
-                pass
-
-        return self.final_file
-
+                if f and f.exists(): f.unlink()
+            except: pass
+        return self.final
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle(APP_NAME)
-        self.resize(1320, 820)
-        self.setMinimumSize(1080, 700)
-        self.recorder = None
-        self.recording = False
-        self.started_at = None
+        super().__init__(); self.setWindowTitle(APP_NAME); self.resize(1400,900); self.setMinimumSize(1120,720)
+        self.recording=False; self.rec=None; self.mode='horizontal'; self.started=0
+        self.setStyleSheet('''QMainWindow,QWidget{background:#0a0e13;color:#edf2f7;font-family:Segoe UI} QFrame#side{background:#0f151d;border-right:1px solid #202936} QLabel#brand{font-size:22px;font-weight:800} QLabel#muted{color:#728096;font-size:10px} QFrame#card,QGroupBox{background:#111821;border:1px solid #202b38;border-radius:12px} QLabel#title{font-size:20px;font-weight:700} QLabel#ct{color:#a9b5c5;font-size:11px;font-weight:700} QLabel#big{font-size:19px;font-weight:750} QLabel#preview{background:#05070a;border:1px solid #263241;border-radius:12px} QComboBox,QLineEdit{background:#0d131b;border:1px solid #293544;border-radius:8px;padding:7px;color:#e8edf3} QPushButton{background:#18212c;border:1px solid #2b3948;border-radius:8px;padding:8px 12px;color:#e8edf3} QPushButton:hover{background:#202c3a} QPushButton#record{background:#e9434a;border:0;font-weight:800;padding:12px 24px} QPushButton#stop{font-weight:700;padding:12px 20px} QPushButton#mode{font-weight:700;padding:9px} QPushButton#mode[active="true"]{background:#29384a;border:1px solid #5a7ea3} QCheckBox{spacing:7px} QSlider::groove:horizontal{height:5px;background:#273241} QSlider::handle:horizontal{width:14px;margin:-5px 0;border-radius:7px;background:#a9b8ca} QProgressBar{height:18px;border:0;border-radius:5px;background:#080c11;text-align:center;color:transparent} QProgressBar::chunk{border-radius:5px;background:#35d07f} QGroupBox{margin-top:8px;padding:10px} QGroupBox::title{subcontrol-origin:margin;left:12px;padding:0 5px;color:#9ba8b9;background:#111821}''')
+        self.build(); self.refresh_monitors(); self.set_mode('horizontal')
+        self.preview_timer=QtCore.QTimer(self); self.preview_timer.timeout.connect(self.preview); self.preview_timer.start(150)
+        self.meter_timer=QtCore.QTimer(self); self.meter_timer.timeout.connect(self.meters); self.meter_timer.start(50)
+        self.clock_timer=QtCore.QTimer(self); self.clock_timer.timeout.connect(self.clock)
 
-        self.preview_timer = QtCore.QTimer(self)
-        self.preview_timer.timeout.connect(self.update_preview)
-        self.clock_timer = QtCore.QTimer(self)
-        self.clock_timer.timeout.connect(self.update_clock)
+    def build(self):
+        central=QtWidgets.QWidget(); root=QtWidgets.QHBoxLayout(central); root.setContentsMargins(0,0,0,0); self.setCentralWidget(central)
+        side=QtWidgets.QFrame(objectName='side'); side.setFixedWidth(205); sl=QtWidgets.QVBoxLayout(side); sl.setContentsMargins(14,20,14,18)
+        sl.addWidget(QtWidgets.QLabel('FLOWRECORDER',objectName='brand')); sl.addWidget(QtWidgets.QLabel('SCREEN STUDIO',objectName='muted')); sl.addSpacing(20)
+        for t,a in [('▣  Estudio',True),('●  Grabaciones',False),('◉  Audio',False),('⚙  Ajustes',False)]:
+            b=QtWidgets.QPushButton(t); b.setObjectName('mode'); b.setProperty('active',a); sl.addWidget(b)
+        sl.addStretch(); sl.addWidget(QtWidgets.QLabel('FlowRecorder 1.3\nMixer + 16:9 + 9:16',objectName='muted')); root.addWidget(side)
+        body=QtWidgets.QWidget(); bl=QtWidgets.QVBoxLayout(body); bl.setContentsMargins(24,18,24,20); root.addWidget(body,1)
+        top=QtWidgets.QHBoxLayout(); top.addWidget(QtWidgets.QLabel('Estudio',objectName='title')); top.addStretch(); self.status=QtWidgets.QLabel('● Listo para grabar',objectName='muted'); top.addWidget(self.status); bl.addLayout(top)
+        stats=QtWidgets.QHBoxLayout(); self.fpslab=self.stat(stats,'FPS','30'); self.timelab=self.stat(stats,'DURACIÓN','00:00:00'); self.audiolab=self.stat(stats,'AUDIO','Mic + sistema'); self.formatlab=self.stat(stats,'FORMATO','16:9'); bl.addLayout(stats)
+        work=QtWidgets.QHBoxLayout(); work.setSpacing(14)
+        pc=QtWidgets.QFrame(objectName='card'); pv=QtWidgets.QVBoxLayout(pc); pv.addWidget(QtWidgets.QLabel('VISTA PREVIA',objectName='ct')); self.prev=QtWidgets.QLabel('Preparando vista previa…',objectName='preview'); self.prev.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter); self.prev.setMinimumSize(620,400); pv.addWidget(self.prev,1); work.addWidget(pc,1)
+        right=QtWidgets.QVBoxLayout(); self.capture(right); self.format(right); self.sources(right); self.destination(right); right.addStretch(); work.addLayout(right); bl.addLayout(work,1)
+        bl.addWidget(self.mixer())
+        bottom=QtWidgets.QFrame(objectName='card'); bb=QtWidgets.QHBoxLayout(bottom); self.start=QtWidgets.QPushButton('●  INICIAR GRABACIÓN',objectName='record'); self.start.clicked.connect(self.start_rec); self.stop=QtWidgets.QPushButton('■  DETENER',objectName='stop'); self.stop.clicked.connect(self.stop_rec); self.stop.setEnabled(False); self.timer=QtWidgets.QLabel('00:00:00',objectName='big'); bb.addWidget(self.start); bb.addWidget(self.stop); bb.addStretch(); bb.addWidget(self.timer); bl.addWidget(bottom)
 
-        self.build_ui()
-        self.refresh_monitors()
-        self.preview_timer.start(150)
+    def stat(self,lay,t,v):
+        c=QtWidgets.QFrame(objectName='card'); x=QtWidgets.QVBoxLayout(c); x.addWidget(QtWidgets.QLabel(t,objectName='ct')); q=QtWidgets.QLabel(v,objectName='big'); x.addWidget(q); lay.addWidget(c,1); return q
 
-    def build_ui(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #0b0f14; color: #edf2f7; font-family: Segoe UI; }
-            QFrame#sidebar { background: #10161e; border-right: 1px solid #202936; }
-            QLabel#brand { font-size: 22px; font-weight: 800; letter-spacing: 1px; }
-            QLabel#brand2 { color: #7f8da1; font-size: 11px; }
-            QPushButton#nav { text-align: left; background: transparent; border: 0; border-radius: 10px; padding: 12px 14px; color: #9daabd; font-size: 13px; }
-            QPushButton#nav:hover, QPushButton#nav[active="true"] { background: #19222e; color: #ffffff; }
-            QFrame#topbar { background: #0f141b; border-bottom: 1px solid #202936; }
-            QLabel#pageTitle { font-size: 20px; font-weight: 700; }
-            QLabel#status { color: #8997aa; }
-            QFrame#card { background: #111821; border: 1px solid #202b38; border-radius: 14px; }
-            QLabel#cardTitle { color: #a9b5c5; font-size: 12px; font-weight: 600; }
-            QLabel#bigValue { font-size: 22px; font-weight: 750; }
-            QLabel#preview { background: #05070a; border: 1px solid #263241; border-radius: 12px; }
-            QComboBox, QLineEdit { background: #0d131b; border: 1px solid #293544; border-radius: 9px; padding: 9px 10px; color: #e8edf3; }
-            QComboBox:hover, QLineEdit:focus { border: 1px solid #4a6079; }
-            QPushButton { background: #18212c; border: 1px solid #2b3948; border-radius: 9px; padding: 9px 13px; color: #e8edf3; }
-            QPushButton:hover { background: #202c3a; }
-            QPushButton#record { background: #e9434a; border: 0; border-radius: 11px; padding: 13px 26px; font-size: 14px; font-weight: 800; }
-            QPushButton#record:hover { background: #f25258; }
-            QPushButton#record:disabled { background: #4c2629; color: #a98b8d; }
-            QPushButton#stop { background: #18212c; border-radius: 11px; padding: 13px 22px; font-weight: 700; }
-            QPushButton#stop:disabled { color: #526071; }
-            QCheckBox { spacing: 8px; color: #d8e0e9; }
-            QCheckBox::indicator { width: 18px; height: 18px; }
-            QGroupBox { background: #111821; border: 1px solid #202b38; border-radius: 14px; margin-top: 10px; padding: 14px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #9ba8b9; background: #111821; }
-        """)
+    def capture(self,lay):
+        g=QtWidgets.QGroupBox('CAPTURA'); f=QtWidgets.QFormLayout(g); self.mon=QtWidgets.QComboBox(); self.fps=QtWidgets.QComboBox(); self.fps.addItems(map(str,FPS)); self.fps.setCurrentText('30'); self.fps.currentTextChanged.connect(lambda x:self.fpslab.setText(x)); f.addRow('Pantalla',self.mon); f.addRow('FPS',self.fps); lay.addWidget(g)
 
-        central = QtWidgets.QWidget()
-        main = QtWidgets.QHBoxLayout(central)
-        main.setContentsMargins(0, 0, 0, 0)
-        main.setSpacing(0)
-        self.setCentralWidget(central)
+    def format(self,lay):
+        g=QtWidgets.QGroupBox('VENTANAS / FORMATO'); v=QtWidgets.QVBoxLayout(g); r=QtWidgets.QHBoxLayout(); self.hbtn=QtWidgets.QPushButton('▭  Horizontal\n16:9',objectName='mode'); self.vbtn=QtWidgets.QPushButton('▯  Vertical\n9:16',objectName='mode'); self.hbtn.clicked.connect(lambda:self.set_mode('horizontal')); self.vbtn.clicked.connect(lambda:self.set_mode('vertical')); r.addWidget(self.hbtn); r.addWidget(self.vbtn); v.addLayout(r); self.hint=QtWidgets.QLabel('Horizontal para YouTube y escritorio',objectName='muted'); v.addWidget(self.hint); lay.addWidget(g)
 
-        sidebar = QtWidgets.QFrame(objectName="sidebar")
-        sidebar.setFixedWidth(205)
-        side = QtWidgets.QVBoxLayout(sidebar)
-        side.setContentsMargins(14, 20, 14, 18)
-        side.setSpacing(6)
+    def sources(self,lay):
+        g=QtWidgets.QGroupBox('FUENTES DE AUDIO'); v=QtWidgets.QVBoxLayout(g); self.mic=QtWidgets.QCheckBox('Grabar micrófono'); self.mic.setChecked(True); self.sys=QtWidgets.QCheckBox('Grabar audio del sistema'); self.sys.setChecked(SYSTEM_AUDIO_AVAILABLE); self.sys.setEnabled(SYSTEM_AUDIO_AVAILABLE); self.mic.stateChanged.connect(self.audio_text); self.sys.stateChanged.connect(self.audio_text); v.addWidget(self.mic); v.addWidget(self.sys); lay.addWidget(g)
 
-        brand = QtWidgets.QLabel("FLOWRECORDER", objectName="brand")
-        brand2 = QtWidgets.QLabel("SCREEN STUDIO", objectName="brand2")
-        side.addWidget(brand)
-        side.addWidget(brand2)
-        side.addSpacing(24)
+    def destination(self,lay):
+        g=QtWidgets.QGroupBox('DESTINO'); v=QtWidgets.QVBoxLayout(g); r=QtWidgets.QHBoxLayout(); self.out=QtWidgets.QLineEdit(str(Path.home()/'Videos'/'FlowRecorder')); b=QtWidgets.QPushButton('Elegir'); b.clicked.connect(self.choose); r.addWidget(self.out); r.addWidget(b); v.addLayout(r); self.file=QtWidgets.QLabel('MP4 • H.264 • AAC',objectName='muted'); v.addWidget(self.file); lay.addWidget(g)
 
-        for text, active in [
-            ("▣  Estudio", True),
-            ("●  Grabaciones", False),
-            ("◉  Audio", False),
-            ("⚙  Ajustes", False),
-        ]:
-            b = QtWidgets.QPushButton(text, objectName="nav")
-            b.setProperty("active", active)
-            side.addWidget(b)
-        side.addStretch()
-
-        version = QtWidgets.QLabel("FlowRecorder 1.2\nAudio de micrófono + sistema")
-        version.setStyleSheet("color:#667487; font-size:10px;")
-        side.addWidget(version)
-        main.addWidget(side)
-
-        content = QtWidgets.QWidget()
-        content_layout = QtWidgets.QVBoxLayout(content)
-        content_layout.setContentsMargins(24, 18, 24, 20)
-        content_layout.setSpacing(16)
-        main.addWidget(content, 1)
-
-        top = QtWidgets.QFrame(objectName="topbar")
-        top.setFixedHeight(58)
-        top_layout = QtWidgets.QHBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        title = QtWidgets.QLabel("Estudio", objectName="pageTitle")
-        self.status_label = QtWidgets.QLabel("●  Listo para grabar", objectName="status")
-        top_layout.addWidget(title)
-        top_layout.addStretch()
-        top_layout.addWidget(self.status_label)
-        content_layout.addWidget(top)
-
-        cards = QtWidgets.QHBoxLayout()
-        cards.setSpacing(12)
-        self.add_stat_card(cards, "MODO", "Pantalla", "▣")
-        self.fps_card = self.add_stat_card(cards, "FPS", "30", "◌")
-        self.timer_card = self.add_stat_card(cards, "DURACIÓN", "00:00:00", "◷")
-        self.audio_card = self.add_stat_card(cards, "AUDIO", "Mic + sistema", "♫")
-        content_layout.addLayout(cards)
-
-        workspace = QtWidgets.QHBoxLayout()
-        workspace.setSpacing(16)
-
-        preview_card = QtWidgets.QFrame(objectName="card")
-        preview_layout = QtWidgets.QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(14, 14, 14, 14)
-        head = QtWidgets.QHBoxLayout()
-        label = QtWidgets.QLabel("VISTA PREVIA", objectName="cardTitle")
-        self.live_badge = QtWidgets.QLabel("● LIVE")
-        self.live_badge.setStyleSheet("color:#657386; font-size:10px; font-weight:700;")
-        head.addWidget(label)
-        head.addStretch()
-        head.addWidget(self.live_badge)
-        preview_layout.addLayout(head)
-
-        self.preview = QtWidgets.QLabel("Preparando vista previa…", objectName="preview")
-        self.preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(650, 420)
-        preview_layout.addWidget(self.preview, 1)
-        workspace.addWidget(preview_card, 1)
-
-        panel = QtWidgets.QVBoxLayout()
-        panel.setSpacing(12)
-        self.add_capture_card(panel)
-        self.add_audio_card(panel)
-        self.add_output_card(panel)
-        panel.addStretch()
-        workspace.addLayout(panel, 0)
-        content_layout.addLayout(workspace, 1)
-
-        bottom = QtWidgets.QFrame(objectName="card")
-        bottom_layout = QtWidgets.QHBoxLayout(bottom)
-        bottom_layout.setContentsMargins(14, 12, 14, 12)
-
-        self.record_btn = QtWidgets.QPushButton("●  INICIAR GRABACIÓN", objectName="record")
-        self.record_btn.clicked.connect(self.start_recording)
-
-        self.stop_btn = QtWidgets.QPushButton("■  DETENER", objectName="stop")
-        self.stop_btn.clicked.connect(self.stop_recording)
-        self.stop_btn.setEnabled(False)
-
-        self.bottom_timer = QtWidgets.QLabel("00:00:00", objectName="bigValue")
-        bottom_layout.addWidget(self.record_btn)
-        bottom_layout.addWidget(self.stop_btn)
-        bottom_layout.addStretch()
-        bottom_layout.addWidget(self.bottom_timer)
-        content_layout.addWidget(bottom)
-
-    def add_stat_card(self, layout, title, value, icon):
-        card = QtWidgets.QFrame(objectName="card")
-        box = QtWidgets.QHBoxLayout(card)
-        box.setContentsMargins(13, 10, 13, 10)
-
-        ico = QtWidgets.QLabel(icon)
-        ico.setStyleSheet("font-size:18px; color:#c4cfdb;")
-
-        texts = QtWidgets.QVBoxLayout()
-        texts.addWidget(QtWidgets.QLabel(title, objectName="cardTitle"))
-        value_label = QtWidgets.QLabel(value, objectName="bigValue")
-        texts.addWidget(value_label)
-
-        box.addWidget(ico)
-        box.addLayout(texts)
-        layout.addWidget(card, 1)
-        return value_label
-
-    def add_capture_card(self, layout):
-        box = QtWidgets.QGroupBox("CAPTURA")
-        form = QtWidgets.QFormLayout(box)
-        form.setVerticalSpacing(10)
-
-        self.monitor_combo = QtWidgets.QComboBox()
-        self.fps_combo = QtWidgets.QComboBox()
-        self.fps_combo.addItems([str(x) for x in FPS_OPTIONS])
-        self.fps_combo.setCurrentText("30")
-        self.fps_combo.currentTextChanged.connect(self.on_fps_changed)
-
-        form.addRow("Pantalla", self.monitor_combo)
-        form.addRow("FPS", self.fps_combo)
-        layout.addWidget(box)
-
-    def add_audio_card(self, layout):
-        box = QtWidgets.QGroupBox("AUDIO")
-        v = QtWidgets.QVBoxLayout(box)
-
-        self.mic_check = QtWidgets.QCheckBox("Grabar micrófono")
-        self.mic_check.setChecked(True)
-        self.mic_check.stateChanged.connect(self.on_audio_changed)
-        v.addWidget(self.mic_check)
-
-        self.system_check = QtWidgets.QCheckBox("Grabar audio del sistema")
-        self.system_check.setChecked(SYSTEM_AUDIO_AVAILABLE)
-        self.system_check.setEnabled(SYSTEM_AUDIO_AVAILABLE)
-        self.system_check.stateChanged.connect(self.on_audio_changed)
-        v.addWidget(self.system_check)
-
-        if SYSTEM_AUDIO_AVAILABLE:
-            hint_text = "WASAPI activo · captura el audio de Windows"
-        else:
-            hint_text = "Audio del sistema requiere PyAudioWPatch en Windows"
-        self.audio_hint = QtWidgets.QLabel(hint_text)
-        self.audio_hint.setStyleSheet("color:#68778a; font-size:10px;")
-        self.audio_hint.setWordWrap(True)
-        v.addWidget(self.audio_hint)
-
-        layout.addWidget(box)
-
-    def add_output_card(self, layout):
-        box = QtWidgets.QGroupBox("DESTINO")
-        v = QtWidgets.QVBoxLayout(box)
-
-        row = QtWidgets.QHBoxLayout()
-        self.output_edit = QtWidgets.QLineEdit(str(Path.home() / "Videos" / "FlowRecorder"))
-        browse = QtWidgets.QPushButton("Elegir")
-        browse.clicked.connect(self.choose_output)
-        row.addWidget(self.output_edit)
-        row.addWidget(browse)
-        v.addLayout(row)
-
-        self.file_label = QtWidgets.QLabel("MP4 • H.264 • AAC")
-        self.file_label.setStyleSheet("color:#68778a; font-size:10px;")
-        v.addWidget(self.file_label)
-
-        layout.addWidget(box)
+    def mixer(self):
+        g=QtWidgets.QFrame(objectName='card'); v=QtWidgets.QVBoxLayout(g); head=QtWidgets.QHBoxLayout(); head.addWidget(QtWidgets.QLabel('MEZCLADOR DE AUDIO',objectName='ct')); head.addStretch(); self.mixstatus=QtWidgets.QLabel('Barras en tiempo real durante la grabación',objectName='muted'); head.addWidget(self.mixstatus); v.addLayout(head); self.rows={}
+        for ch,name in [('mic','🎙  Micrófono'),('system','🔊  Audio del sistema')]:
+            r=QtWidgets.QHBoxLayout(); r.addWidget(QtWidgets.QLabel(name)); bar=QtWidgets.QProgressBar(); bar.setRange(0,100); r.addWidget(bar,1); db=QtWidgets.QLabel('-∞ dB'); db.setMinimumWidth(55); r.addWidget(db); s=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); s.setRange(0,200); s.setValue(100); s.setFixedWidth(90); m=QtWidgets.QPushButton('M'); m.setCheckable(True); m.setFixedWidth(30); r.addWidget(s); r.addWidget(m); v.addLayout(r); self.rows[ch]=(bar,db,s,m); s.valueChanged.connect(lambda x,c=ch:self.gain(c,x)); m.toggled.connect(lambda x,c=ch:self.mute(c,x))
+        return g
 
     def refresh_monitors(self):
-        self.monitor_combo.clear()
+        self.mon.clear()
         try:
             with mss() as sct:
-                for i, monitor in enumerate(sct.monitors[1:], 1):
-                    self.monitor_combo.addItem(
-                        f"Pantalla {i} · {monitor['width']}×{monitor['height']}",
-                        monitor,
-                    )
-        except Exception:
-            self.monitor_combo.addItem("No se pudo detectar la pantalla")
+                for i,m in enumerate(sct.monitors[1:],1): self.mon.addItem(f"Pantalla {i} · {m['width']}×{m['height']}",m)
+        except: pass
 
-        if self.monitor_combo.count() == 0:
-            self.monitor_combo.addItem("No se detectó pantalla")
+    def choose(self):
+        p=QtWidgets.QFileDialog.getExistingDirectory(self,'Seleccionar carpeta de grabaciones')
+        if p:self.out.setText(p)
 
-    def choose_output(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Seleccionar carpeta de grabaciones"
-        )
-        if path:
-            self.output_edit.setText(path)
+    def set_mode(self,mode):
+        if self.recording:return
+        self.mode=mode; h=mode=='horizontal'; self.hbtn.setProperty('active',h); self.vbtn.setProperty('active',not h)
+        for b in (self.hbtn,self.vbtn): b.style().unpolish(b); b.style().polish(b)
+        self.formatlab.setText('16:9' if h else '9:16'); self.hint.setText('Horizontal para YouTube y escritorio' if h else 'Vertical para Shorts, Reels y TikTok'); self.preview()
 
-    def on_fps_changed(self, value):
-        self.fps_card.setText(value)
+    def audio_text(self):
+        a=self.mic.isChecked(); b=self.sys.isChecked(); self.audiolab.setText('Mic + sistema' if a and b else 'Micrófono' if a else 'Sistema' if b else 'Sin audio')
 
-    def on_audio_changed(self):
-        mic = self.mic_check.isChecked()
-        system = self.system_check.isChecked()
-        if mic and system:
-            text = "Mic + sistema"
-        elif mic:
-            text = "Micrófono"
-        elif system:
-            text = "Sistema"
-        else:
-            text = "Sin audio"
-        self.audio_card.setText(text)
+    def gain(self,ch,x):
+        if self.recording:self.rec.set_channel(ch,gain=x/100)
 
-    def update_preview(self):
-        if self.recording:
-            return
+    def mute(self,ch,x):
+        if self.recording:self.rec.set_channel(ch,mute=x)
+
+    def capture_rect(self,m):
+        w,h=int(m['width']),int(m['height'])
+        if self.mode=='vertical':
+            nw=min(w,int(h*9/16)); nw-=nw%2; return {'left':m['left']+(w-nw)//2,'top':m['top'],'width':nw,'height':h-h%2}
+        nh=min(h,int(w*9/16)); nh-=nh%2; return {'left':m['left'],'top':m['top']+(h-nh)//2,'width':w-w%2,'height':nh}
+
+    def preview(self):
+        if self.recording:return
         try:
-            monitor = self.monitor_combo.currentData()
-            if not monitor:
-                return
+            m=self.mon.currentData()
+            if not m:return
+            with mss() as sct: a=np.asarray(sct.grab(self.capture_rect(m)))
+            h,w,_=a.shape; im=QtGui.QImage(a.data,w,h,4*w,QtGui.QImage.Format.Format_ARGB32).copy(); self.prev.setPixmap(QtGui.QPixmap.fromImage(im).scaled(self.prev.size(),QtCore.Qt.AspectRatioMode.KeepAspectRatio,QtCore.Qt.TransformationMode.SmoothTransformation))
+        except: pass
 
-            with mss() as sct:
-                shot = np.asarray(sct.grab(monitor))
+    def meters(self):
+        vals={'mic':self.rec.mic_level if self.recording and self.rec else 0,'system':self.rec.system_level if self.recording and self.rec else 0}
+        for ch,x in vals.items():
+            bar,db,_,_=self.rows[ch]; bar.setValue(int(x)); db.setText('-∞ dB' if x<.1 else f"{-60+x*.6:4.1f} dB")
 
-            h, w, _ = shot.shape
-            image = QtGui.QImage(
-                shot.data, w, h, 4 * w,
-                QtGui.QImage.Format.Format_ARGB32,
-            ).copy()
-            pix = QtGui.QPixmap.fromImage(image)
-            self.preview.setPixmap(
-                pix.scaled(
-                    self.preview.size(),
-                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        except Exception:
-            pass
+    def controls(self,on):
+        for w in (self.mon,self.fps,self.hbtn,self.vbtn,self.mic):w.setEnabled(on)
+        self.sys.setEnabled(on and SYSTEM_AUDIO_AVAILABLE)
 
-    def set_audio_controls_enabled(self, enabled):
-        self.mic_check.setEnabled(enabled)
-        self.system_check.setEnabled(enabled and SYSTEM_AUDIO_AVAILABLE)
-        self.monitor_combo.setEnabled(enabled)
-        self.fps_combo.setEnabled(enabled)
+    def start_rec(self):
+        m=self.mon.currentData(); out=self.out.text().strip()
+        if not m or not out:return QtWidgets.QMessageBox.warning(self,APP_NAME,'Selecciona pantalla y carpeta de salida.')
+        mic=self.mic.isChecked(); system=self.sys.isChecked()
+        if system and not SYSTEM_AUDIO_AVAILABLE:return QtWidgets.QMessageBox.warning(self,APP_NAME,'El audio del sistema no está disponible en esta versión.')
+        gains={c:r[2].value()/100 for c,r in self.rows.items()}; mutes={c:r[3].isChecked() for c,r in self.rows.items()}
+        self.rec=Recorder(m,int(self.fps.currentText()),out,self.mode,mic,system,gains,mutes); self.rec.start(); self.recording=True; self.started=time.monotonic(); self.controls(False); self.start.setEnabled(False); self.stop.setEnabled(True); self.status.setText('● GRABANDO'); self.status.setStyleSheet('color:#ff5960;font-weight:800'); self.mixstatus.setText('● MONITOREANDO EN VIVO'); self.mixstatus.setStyleSheet('color:#53d88a;font-weight:800'); self.clock_timer.start(250)
 
-    def start_recording(self):
-        if self.recording:
-            return
-
-        monitor = self.monitor_combo.currentData()
-        if not monitor:
-            QtWidgets.QMessageBox.warning(
-                self, APP_NAME, "No se encontró una pantalla para capturar."
-            )
-            return
-
-        output_dir = self.output_edit.text().strip()
-        if not output_dir:
-            QtWidgets.QMessageBox.warning(
-                self, APP_NAME, "Selecciona una carpeta de salida."
-            )
-            return
-
-        mic = self.mic_check.isChecked()
-        system = self.system_check.isChecked()
-
-        if not mic and not system:
-            answer = QtWidgets.QMessageBox.question(
-                self,
-                APP_NAME,
-                "Has desactivado todo el audio. ¿Quieres grabar solo la pantalla?",
-                QtWidgets.QMessageBox.StandardButton.Yes
-                | QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
-
-        if system and not SYSTEM_AUDIO_AVAILABLE:
-            QtWidgets.QMessageBox.warning(
-                self,
-                APP_NAME,
-                "La captura de audio del sistema no está disponible en esta versión.",
-            )
-            return
-
-        fps = int(self.fps_combo.currentText())
-        self.recorder = Recorder(
-            monitor,
-            fps,
-            output_dir,
-            mic_enabled=mic,
-            system_enabled=system,
-        )
-
+    def stop_rec(self):
+        if not self.recording:return
+        self.stop.setEnabled(False); self.status.setText('● GUARDANDO…'); QtWidgets.QApplication.processEvents()
         try:
-            self.recorder.start()
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, APP_NAME, str(exc))
-            return
-
-        self.recording = True
-        self.started_at = time.monotonic()
-
-        self.record_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.set_audio_controls_enabled(False)
-
-        self.status_label.setText("●  GRABANDO")
-        self.status_label.setStyleSheet("color:#ff5960; font-weight:800;")
-        self.live_badge.setStyleSheet(
-            "color:#ff5960; font-size:10px; font-weight:800;"
-        )
-        self.clock_timer.start(250)
-
-    def stop_recording(self):
-        if not self.recording or not self.recorder:
-            return
-
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("●  GUARDANDO…")
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            final_file = self.recorder.stop()
-            self.status_label.setText("●  Grabación guardada")
-            self.file_label.setText(f"Guardado: {final_file.name}")
-            QtWidgets.QMessageBox.information(
-                self,
-                APP_NAME,
-                f"Grabación terminada.\n\n{final_file}",
-            )
-        except Exception as exc:
-            self.status_label.setText("●  Error")
-            QtWidgets.QMessageBox.critical(self, APP_NAME, str(exc))
+            f=self.rec.stop(); self.file.setText('Guardado: '+f.name); QtWidgets.QMessageBox.information(self,APP_NAME,'Grabación terminada.\n\n'+str(f)); self.status.setText('● Grabación guardada')
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self,APP_NAME,str(e)); self.status.setText('● Error')
         finally:
-            self.recording = False
-            self.clock_timer.stop()
-            self.record_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.set_audio_controls_enabled(True)
-            self.live_badge.setStyleSheet(
-                "color:#657386; font-size:10px; font-weight:700;"
-            )
+            self.recording=False; self.rec=None; self.clock_timer.stop(); self.controls(True); self.start.setEnabled(True); self.stop.setEnabled(False); self.mixstatus.setText('Barras en tiempo real durante la grabación'); self.mixstatus.setStyleSheet('color:#728096;font-size:10px'); self.status.setStyleSheet('color:#728096')
 
-    def update_clock(self):
-        if self.started_at is None:
-            return
-        elapsed = int(time.monotonic() - self.started_at)
-        text = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-        self.bottom_timer.setText(text)
-        self.timer_card.setText(text)
+    def clock(self):
+        t=int(time.monotonic()-self.started); s=time.strftime('%H:%M:%S',time.gmtime(t)); self.timer.setText(s); self.timelab.setText(s)
 
-    def closeEvent(self, event):
+    def closeEvent(self,e):
         if self.recording:
-            answer = QtWidgets.QMessageBox.question(
-                self,
-                APP_NAME,
-                "Hay una grabación activa. ¿Quieres detenerla antes de salir?",
-                QtWidgets.QMessageBox.StandardButton.Yes
-                | QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer == QtWidgets.QMessageBox.StandardButton.Yes:
-                self.stop_recording()
-            else:
-                event.ignore()
-                return
-        event.accept()
-
+            a=QtWidgets.QMessageBox.question(self,APP_NAME,'Hay una grabación activa. ¿Detener antes de salir?',QtWidgets.QMessageBox.StandardButton.Yes|QtWidgets.QMessageBox.StandardButton.No)
+            if a==QtWidgets.QMessageBox.StandardButton.Yes:self.stop_rec()
+            else:e.ignore();return
+        e.accept()
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+    app=QtWidgets.QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setStyle('Fusion'); w=MainWindow(); w.show(); sys.exit(app.exec())
+if __name__=='__main__': main()
